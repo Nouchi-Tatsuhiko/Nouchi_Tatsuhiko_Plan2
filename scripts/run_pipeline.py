@@ -1,3 +1,8 @@
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import pandas as pd
 from features.feature_engineering import feature_engineering_pipeline
 from features.labeling import make_long_short_label_and_drop_nan
@@ -15,5 +20,18 @@ df = make_long_short_label_and_drop_nan(df)
 # 学習＆モデル保存
 label_col = 'y'
 exclude_cols = [label_col]
-feature_cols = [col for col in df.columns if (col not in exclude_cols)]
-train_with_feature_selection(df, feature_cols, label_col, n_drop=20)
+feature_cols = [
+    col for col in df.columns
+    if (col not in exclude_cols) and (pd.api.types.is_numeric_dtype(df[col]))
+]
+train_with_feature_selection(df, feature_cols, label_col)
+
+# 結果はmodel/train_model.py内でpickle保存される
+# 可視化はscripts/plot_cv_results.pyを参照
+# もしくはnotebooks/visualize_cv_results.ipynbを参照
+
+import pickle
+
+results = train_with_feature_selection(df, feature_cols, label_col)
+with open("results_cv.pkl", "wb") as f:
+    pickle.dump(results, f)
