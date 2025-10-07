@@ -12,12 +12,17 @@ def train_with_feature_selection(
     n_drop=30,
     params=None,
     verbose_eval=0,
-    model_save_path="lgbm_final_model.txt"
-):
-    # =======================
-    # 交差検証+特徴量選択+最終モデルfit＆保存までを一つの関数で実行する
-    # =======================
-    
+    model_save_path="lgbm_final_model.txt",
+    holdout_ratio=0.3,
+    datetime_col="datetime"
+    ):
+    # ====== 前処理：時系列でホールドアウト分割 ======
+    df = df.sort_values(datetime_col)
+    split_idx = int(len(df) * (1 - holdout_ratio))
+    train_df = df.iloc[:split_idx]
+    test_df = df.iloc[split_idx:]
+    print(f"Train samples: {len(train_df)}, Test(Holdout) samples: {len(test_df)}")
+
     if params is None:
         params = {
             'objective': 'multiclass',
@@ -36,13 +41,19 @@ def train_with_feature_selection(
             'min_child_samples': 10,
         }
 
-    X = df[feature_cols].values
-    y = df[label_col].astype(int).values
+    X = train_df[feature_cols].values
+    y = train_df[label_col].astype(int).values
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     cv_scores = []
     cv_reports = []
     fold_importances = []
     conf_matrices = []
+
+    # fold内fit用コールバック（early_stoppingあり）
+    fold_callbacks = [lgb.log_evaluation(verbose_eval),
+                      lgb.early_stopping(stopping_rounds=20, verbose=False)]
+    # 最終fit用コールバック（early_stoppingなし）
+    final_callbacks = [lgb.log_evaluation(verbose_eval)]
 
     for fold, (train_idx, valid_idx) in enumerate(skf.split(X, y), 1):
         print(f"===== Fold {fold} =====")
@@ -57,16 +68,14 @@ def train_with_feature_selection(
             params, dtrain_full,
             valid_sets=[dvalid_full],
             num_boost_round=10000,
-            callbacks=[
-                lgb.early_stopping(stopping_rounds=20, verbose=False),
-                lgb.log_evaluation(verbose_eval)
-            ]
+            callbacks=fold_callbacks
         )
+
+        # 重要度の低い特徴量をn_drop個抽出
         importances = gbm_full.feature_importance(importance_type='gain')
         importance_df = pd.DataFrame({'feature': feature_list, 'importance': importances})
         low_features = importance_df.sort_values('importance').head(n_drop)['feature'].tolist()
         fold_importances.append(importance_df)
-        # 低重要度特徴量を削除
         feature_list_red = [f for f in feature_list if f not in low_features]
         print(f"特徴量数: {len(feature_list_red)} (削除: {n_drop}個)")
 
@@ -79,10 +88,7 @@ def train_with_feature_selection(
             params, dtrain_red,
             valid_sets=[dvalid_red],
             num_boost_round=10000,
-            callbacks=[
-                lgb.early_stopping(stopping_rounds=20, verbose=False),
-                lgb.log_evaluation(verbose_eval)
-            ]
+            callbacks=fold_callbacks
         )
         y_pred = gbm_red.predict(X_val_red, num_iteration=gbm_red.best_iteration)
         y_pred_classes = np.argmax(y_pred, axis=1)
@@ -93,7 +99,6 @@ def train_with_feature_selection(
         cv_reports.append(classification_report(y_val, y_pred_classes, digits=5, output_dict=True))
         conf_matrices.append(confusion_matrix(y_val, y_pred_classes))
 
-    # 重要度の低い特徴量の頻度可視化（foldをまたいでよく落とされた特徴量の分析など）
     feature_drop_counts = {}
     for imp in fold_importances:
         dropped = imp.sort_values('importance').head(n_drop)['feature'].tolist()
@@ -105,25 +110,39 @@ def train_with_feature_selection(
     print("最終モデルで使用する特徴量数:", len(final_feature_list))
     print("最終モデル特徴量リスト:", final_feature_list)
 
-    # 削除後特徴量で全データfit→モデル保存
-    X_final = df[final_feature_list].values
-    y_final = df[label_col].astype(int).values
+    X_final = train_df[final_feature_list].values
+    y_final = train_df[label_col].astype(int).values
 
     dtrain_final = lgb.Dataset(X_final, label=y_final)
+    # 最終fitはearly_stoppingなし！
+    print("final_callbacks:", final_callbacks)
+    final_gbm = lgb.train(
+    params, dtrain_final,
+    num_boost_round=10000,
+    callbacks=final_callbacks
+)
     final_gbm = lgb.train(
         params, dtrain_final,
         num_boost_round=10000,
-        callbacks=[
-            lgb.early_stopping(stopping_rounds=20, verbose=False),
-            lgb.log_evaluation(verbose_eval)
-        ]
+        callbacks=final_callbacks
     )
 
     final_gbm.save_model(model_save_path)
-    print(f"全データで学習した最終モデルを {model_save_path} として保存しました。")
+    print(f"Trainデータで学習した最終モデルを {model_save_path} として保存しました。")
 
-    # 可視化（棒グラフやヒートマップ、スコア推移）
-    # 必要なら元コードのまま呼び出し可
+    # ==== バックテスト（test_dfで評価） ====
+    X_test = test_df[final_feature_list].values
+    y_test = test_df[label_col].astype(int).values
+    y_pred_proba = final_gbm.predict(X_test, num_iteration=final_gbm.best_iteration)
+    y_pred = np.argmax(y_pred_proba, axis=1)
+    test_df["pred"] = y_pred
+
+    label_map = {0: 0, 1: 1, 2: -1}
+    test_df["pred"] = test_df["pred"].map(label_map)
+
+    test_acc = accuracy_score(y_test, y_pred)
+    print("【バックテスト期間での精度】:", test_acc)
+    print(classification_report(y_test, y_pred))
 
     return {
         "final_model": final_gbm,
@@ -132,5 +151,7 @@ def train_with_feature_selection(
         "cv_reports": cv_reports,
         "conf_matrices": conf_matrices,
         "drop_summary": drop_summary,
-        "fold_importances": fold_importances
+        "fold_importances": fold_importances,
+        "test_acc": test_acc,
+        "test_df": test_df
     }
